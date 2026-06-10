@@ -1,0 +1,52 @@
+# Deployment + NodePort Service for the PQC TLS server.
+#
+# The TLS certs/keys come from a Secret (created by deploy.sh from the certs
+# that gen-certs.sh produced) and are mounted read-only at /certs.
+#
+# The Service is type NodePort on 30443, matching the kind extraPortMapping,
+# so the host reaches the pod at https://localhost:30443.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pqc-server
+  labels: { app: pqc-server }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: pqc-server }
+  template:
+    metadata:
+      labels: { app: pqc-server }
+    spec:
+      containers:
+        - name: pqc-server
+          image: pqc-workshop-server:local   # loaded via `kind load docker-image`
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8443
+          env:
+            # Offer PQC hybrid first, classical second — realistic posture.
+            - name: KEX_GROUPS
+              value: "X25519MLKEM768:x25519"
+          volumeMounts:
+            - name: certs
+              mountPath: /certs
+              readOnly: true
+      volumes:
+        - name: certs
+          secret:
+            secretName: pqc-certs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pqc-server
+spec:
+  type: NodePort
+  selector:
+    app: pqc-server
+  ports:
+    - port: 8443           # service port
+      targetPort: 8443     # container port
+      nodePort: 30443      # MUST match kind-config containerPort
+      protocol: TCP

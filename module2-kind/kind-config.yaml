@@ -1,0 +1,18 @@
+# kind cluster config for the PQC workshop.
+#
+# extraPortMappings forwards the host's :30443 straight to the same port on
+# the kind node container, so a NodePort Service on 30443 is reachable at
+# localhost:30443 from your Fedora desktop — no ingress controller required.
+#
+# Rule that trips everyone up: the Service's nodePort MUST equal the
+# containerPort here (both 30443). They are wired by number, not by name.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: pqc-workshop
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30443
+        hostPort: 30443
+        listenAddress: "127.0.0.1"
+        protocol: TCP

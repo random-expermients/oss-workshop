@@ -1,0 +1,57 @@
+# =============================================================================
+#  Module 3 container — a self-contained liboqs + oqs-provider eval box.
+#
+#  Build a provider that plugs into OpenSSL 3.5 WITHOUT touching your host
+#  OpenSSL. Everything (liboqs, oqs-provider, the eval scripts) lives here.
+#
+#  Build:  podman build -t pqc-oqs-eval -f Containerfile .
+#          (or: docker build -t pqc-oqs-eval -f Containerfile .)
+#  Run:    podman run --rm -it pqc-oqs-eval
+#          then inside:  ./evaluate.sh
+#
+#  Fedora 43+ for native OpenSSL 3.5 (so the "oqs defers to native" lesson
+#  is demonstrable inside the container too).
+# =============================================================================
+FROM fedora:43
+
+RUN dnf -y install gcc gcc-c++ cmake ninja-build git \
+        openssl openssl-devel python3 \
+    && dnf clean all
+
+# Verify native OpenSSL is 3.5+ so the deferral teaching point holds.
+RUN openssl version | grep -qE 'OpenSSL 3\.(5|6|7|8|9)' \
+    || (echo "ERROR: need OpenSSL >= 3.5; got $(openssl version)" && exit 1)
+
+ENV PREFIX=/opt/oqs
+
+# --- liboqs with HQC enabled (the candidate we evaluate) ---
+RUN git clone --depth 1 https://github.com/open-quantum-safe/liboqs /src/liboqs \
+    && cmake -S /src/liboqs -B /src/liboqs/build -GNinja \
+         -DCMAKE_INSTALL_PREFIX=$PREFIX \
+         -DOQS_ENABLE_KEM_HQC=ON \
+         -DBUILD_SHARED_LIBS=ON \
+    && ninja -C /src/liboqs/build \
+    && ninja -C /src/liboqs/build install
+
+# --- oqs-provider against that liboqs ---
+RUN git clone --depth 1 https://github.com/open-quantum-safe/oqs-provider /src/oqs-provider \
+    && cmake -S /src/oqs-provider -B /src/oqs-provider/build -GNinja \
+         -DCMAKE_PREFIX_PATH=$PREFIX \
+         -Dliboqs_DIR=$PREFIX/lib64/cmake/liboqs \
+    && ninja -C /src/oqs-provider/build \
+    && install -Dm755 "$(find /src/oqs-provider/build -name oqsprovider.so | head -1)" \
+         /opt/oqs/lib/oqsprovider.so
+
+# Wire the provider onto the OpenSSL module path + the liboqs runtime path.
+ENV OPENSSL_MODULES=/opt/oqs/lib
+ENV LD_LIBRARY_PATH=/opt/oqs/lib64
+
+WORKDIR /work
+COPY evaluate.sh /work/evaluate.sh
+RUN chmod +x /work/evaluate.sh
+
+# Smoke test at build time: both providers must load.
+RUN openssl list -providers -provider oqsprovider -provider default >/dev/null \
+    && echo "oqs-provider loads OK"
+
+CMD ["/bin/bash"]
