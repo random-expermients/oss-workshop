@@ -24,10 +24,17 @@ RUN openssl version | grep -qE 'OpenSSL 3\.(5|6|7|8|9)' \
 
 ENV PREFIX=/opt/oqs
 
-# --- liboqs with HQC enabled (the candidate we evaluate) ---
+# --- liboqs with the algorithms evaluate.sh demonstrates ---
+#  KEM       : FrodoKEM (primary) + BIKE (fallback)   — both on by default,
+#              enabled explicitly here so the demo never depends on defaults.
+#  SIGNATURE : SLH-DSA / SPHINCS+                      — on by default too.
+#  HQC is also enabled (disabled by default in liboqs) as an extra candidate.
 RUN git clone --depth 1 https://github.com/open-quantum-safe/liboqs /src/liboqs \
     && cmake -S /src/liboqs -B /src/liboqs/build -GNinja \
          -DCMAKE_INSTALL_PREFIX=$PREFIX \
+         -DOQS_ENABLE_KEM_FRODOKEM=ON \
+         -DOQS_ENABLE_KEM_BIKE=ON \
+         -DOQS_ENABLE_SIG_SPHINCS=ON \
          -DOQS_ENABLE_KEM_HQC=ON \
          -DBUILD_SHARED_LIBS=ON \
     && ninja -C /src/liboqs/build \
@@ -50,8 +57,15 @@ WORKDIR /work
 COPY evaluate.sh /work/evaluate.sh
 RUN chmod +x /work/evaluate.sh
 
-# Smoke test at build time: both providers must load.
+# Smoke test at build time: both providers must load AND the algorithms the
+# demo relies on (a Frodo/BIKE KEM and an SLH-DSA/SPHINCS+ signature) exist.
 RUN openssl list -providers -provider oqsprovider -provider default >/dev/null \
-    && echo "oqs-provider loads OK"
+    && echo "oqs-provider loads OK" \
+    && openssl list -kem-algorithms -provider oqsprovider -provider default \
+         | grep -iqE 'frodo|bike' \
+    && echo "FrodoKEM/BIKE present OK" \
+    && openssl list -signature-algorithms -provider oqsprovider -provider default \
+         | grep -iqE 'slh-dsa|sphincs' \
+    && echo "SLH-DSA/SPHINCS+ present OK"
 
 CMD ["/bin/bash"]
