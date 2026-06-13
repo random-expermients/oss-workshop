@@ -36,6 +36,19 @@ pick_alg(){ # $1 = list type (kem|signature) ; $2 = grep -E regex
     | grep -ioE "$2" | head -1
 }
 
+# Locate a liboqs speed harness (built by build-oqs.sh / the Containerfile).
+find_harness(){ # $1 = binary name (speed_kem|speed_sig)
+  local p
+  for p in "/src/liboqs/build/tests/$1" \
+           "/tmp/liboqs/build/tests/$1" \
+           "$HOME/liboqs/build/tests/$1" \
+           "$HOME/oqs-local/bin/$1"; do
+    [ -x "$p" ] && { echo "$p"; return 0; }
+  done
+  command -v "$1" 2>/dev/null && return 0
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 line "1. What is a provider?  (a pluggable crypto backend)"
 cat <<'TXT'
@@ -84,32 +97,46 @@ the deliberately "boring" safe choice). BIKE is the code-based alternative.
 Neither is in native OpenSSL, so this is exactly the "try a new algo"
 scenario the provider architecture exists for.
 TXT
-echo "--- searching for a FrodoKEM algorithm in this build: ---"
+echo "--- (a) confirm the candidate is exposed by the provider: ---"
 KEM_ALG="$(pick_alg kem 'frodo[a-z0-9]+')"
 if [ -z "${KEM_ALG:-}" ]; then
   echo "    FrodoKEM not found; falling back to BIKE..."
   KEM_ALG="$(pick_alg kem 'bike[a-z0-9]*')"
 fi
+[ -n "${KEM_ALG:-}" ] \
+  && echo "    provider advertises KEM: $KEM_ALG (used in the handshake below)" \
+  || echo "    no FrodoKEM/BIKE in provider — rebuild liboqs with those enabled."
 
-if [ -n "${KEM_ALG:-}" ]; then
-  echo "    using KEM algorithm: $KEM_ALG"
-  echo
-  echo "--- (a) generate a KEM keypair via the provider (genpkey): ---"
-  if openssl genpkey -algorithm "$KEM_ALG" $OQS -out kem.key 2>/dev/null; then
-    echo "    -> wrote kem.key ($(wc -c < kem.key) bytes private key blob)"
-    openssl pkey -in kem.key $OQS -pubout -out kem.pub 2>/dev/null \
-      && echo "    -> wrote kem.pub ($(wc -c < kem.pub) bytes public key blob)"
+cat <<'TXT'
+
+    Note: oqs-provider KEM keys have no standard PEM/DER encoder, so a bare
+    `openssl genpkey -out file` can't serialize them (a real evaluation
+    finding, not a bug). A KEM is meant to be exercised by encaps/decaps, so
+    we demonstrate it two honest ways:
+      (b) the liboqs speed harness — real keygen + encaps + decaps + sizes
+      (6) a real TLS 1.3 handshake using the FrodoKEM hybrid group
+TXT
+echo "--- (b) real keygen/encaps/decaps + sizes via the liboqs harness: ---"
+SPEED_KEM="$(find_harness speed_kem || true)"
+if [ -n "${SPEED_KEM:-}" ]; then
+  # Map to a liboqs algorithm name (FrodoKEM-* / BIKE-*); prefer FrodoKEM.
+  KEM_BENCH="$("$SPEED_KEM" --algs 2>/dev/null | grep -iE '^FrodoKEM-' | head -1)"
+  [ -z "${KEM_BENCH:-}" ] && KEM_BENCH="$("$SPEED_KEM" --algs 2>/dev/null | grep -iE '^BIKE-' | head -1)"
+  if [ -n "${KEM_BENCH:-}" ]; then
+    echo "    benchmarking $KEM_BENCH (1s/op); watch the 'public key/ciphertext bytes':"
+    "$SPEED_KEM" -i -d 1 "$KEM_BENCH" 2>/dev/null \
+      | grep -iE "$KEM_BENCH|keygen|encaps|decaps|public key bytes" \
+      || echo "    (harness ran but produced no rows; see build logs)"
     echo
-    echo "    The headline evaluation finding for FrodoKEM/BIKE is SIZE: the"
-    echo "    public keys and ciphertexts are large compared to ML-KEM — that"
-    echo "    is the on-the-wire cost a TLS-focused evaluation must surface."
+    echo "    The headline finding: FrodoKEM/BIKE public keys and ciphertexts are"
+    echo "    KILOBYTES (vs ~0.8 KB for ML-KEM-512) — the on-the-wire cost a"
+    echo "    TLS-focused evaluation must surface."
   else
-    echo "    (genpkey for $KEM_ALG not supported in this build — itself a"
-    echo "     legitimate evaluation finding to report, not a script bug)"
+    echo "    (harness present but lists no FrodoKEM/BIKE algorithm)"
   fi
 else
-  echo "    Neither FrodoKEM nor BIKE found. Rebuild liboqs with"
-  echo "    -DOQS_ENABLE_KEM_FRODOKEM=ON (and/or -DOQS_ENABLE_KEM_BIKE=ON)."
+  echo "    (liboqs speed_kem not found; the TLS handshake in step 6 still"
+  echo "     demonstrates the KEM end-to-end)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -157,30 +184,59 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-line "6. Put it together: a REAL TLS 1.3 handshake (Frodo group + SLH-DSA cert)"
+line "6. Put it together: a REAL TLS 1.3 handshake over the FrodoKEM group"
 cat <<'TXT'
 Now the payoff: the SAME openssl s_server/s_client binaries speak a brand-new
-KEM for key exchange and authenticate with an SLH-DSA certificate, purely
-because a provider was loaded. No recompiled openssl, no patched TLS stack.
-We run server + client locally and confirm the negotiated group and cert.
+KEM for key exchange, purely because a provider was loaded. No recompiled
+openssl, no patched TLS stack. We run server + client locally and confirm the
+negotiated group.
+
+About the certificate: SLH-DSA is a perfectly good signature (we just signed
+and verified with it in step 5), but OpenSSL 3.5's TLS stack does NOT yet
+accept SLH-DSA certificates for handshake authentication — itself a useful
+evaluation finding. So we authenticate with ML-DSA (also post-quantum), giving
+a fully-PQC handshake: FrodoKEM key exchange + ML-DSA signature.
 TXT
 
 # Find a classic-hybrid Frodo TLS group (these are what s_server/s_client speak).
 TLS_GROUP="$(openssl list -kem-algorithms $OQS 2>/dev/null \
   | grep -ioE '(p256|x25519|p384)_frodo[a-z0-9]+' | head -1)"
 [ -z "${TLS_GROUP:-}" ] && TLS_GROUP="$(openssl list -kem-algorithms $OQS 2>/dev/null \
-  | grep -ioE '(p256|x25519|p384)_bike[a-z0-9]*' | head -1)"
+  | grep -ioE '(p256|x25519|p384|p521|x448)_bike[a-z0-9]*' | head -1)"
 
-if [ -n "${SIG_ALG:-}" ] && [ -n "${TLS_GROUP:-}" ]; then
-  echo "    TLS group     : $TLS_GROUP"
-  echo "    cert signature: $SIG_ALG"
+# Native ML-DSA for certificate authentication.
+CERT_SIG="$(pick_alg signature 'ml-dsa-65')"
+[ -z "${CERT_SIG:-}" ] && CERT_SIG="$(pick_alg signature 'ml-dsa-[0-9]+')"
+[ -z "${CERT_SIG:-}" ] && CERT_SIG="$(pick_alg signature 'mldsa[0-9]+')"
+
+if [ -n "${TLS_GROUP:-}" ] && [ -n "${CERT_SIG:-}" ]; then
+  echo "    TLS key-exchange group : $TLS_GROUP   (FrodoKEM/BIKE — the candidate)"
+  echo "    certificate signature  : $CERT_SIG   (ML-DSA — PQC authentication)"
   echo
-  echo "--- (a) make a self-signed SLH-DSA server certificate: ---"
-  if openssl req -x509 -new -newkey "$SIG_ALG" -keyout server.key -out server.crt \
+  echo "--- (a) optional finding: confirm SLH-DSA is rejected by the TLS stack ---"
+  if [ -n "${SIG_ALG:-}" ] \
+     && openssl req -x509 -new -newkey "$SIG_ALG" -keyout slh-srv.key -out slh-srv.crt \
+          -nodes -subj "/CN=pqc-demo.local" -days 1 $OQS >/dev/null 2>&1; then
+    openssl s_server -accept 4432 -tls1_3 $OQS -groups "$TLS_GROUP" \
+        -cert slh-srv.crt -key slh-srv.key -www >slh.log 2>&1 &
+    SLH_PID=$!; sleep 1
+    if grep -qi 'error setting certificate\|unknown certificate type' slh.log 2>/dev/null; then
+      echo "    -> confirmed: OpenSSL 3.5 TLS refuses an SLH-DSA server cert"
+      echo "       ($(grep -i error slh.log | head -1 | sed 's/^.*:error:/error:/'))"
+    else
+      echo "    -> SLH-DSA cert was accepted by this build (newer than expected)"
+    fi
+    kill "$SLH_PID" 2>/dev/null; wait "$SLH_PID" 2>/dev/null
+  else
+    echo "    (skipped — no SLH-DSA available to test)"
+  fi
+  echo
+  echo "--- (b) make a self-signed ML-DSA server certificate: ---"
+  if openssl req -x509 -new -newkey "$CERT_SIG" -keyout server.key -out server.crt \
         -nodes -subj "/CN=pqc-demo.local" -days 1 $OQS 2>/dev/null; then
-    echo "    -> server.crt + server.key (signed with $SIG_ALG)"
+    echo "    -> server.crt + server.key (signed with $CERT_SIG)"
     echo
-    echo "--- (b) start s_server in the background on :4433: ---"
+    echo "--- (c) start s_server in the background on :4433: ---"
     openssl s_server -accept 4433 -tls1_3 $OQS \
         -groups "$TLS_GROUP" \
         -cert server.crt -key server.key -www >server.log 2>&1 &
@@ -189,22 +245,25 @@ if [ -n "${SIG_ALG:-}" ] && [ -n "${TLS_GROUP:-}" ]; then
     for _ in 1 2 3 4 5 6 7 8 9 10; do
       kill -0 "$SRV_PID" 2>/dev/null || break
       (exec 3<>/dev/tcp/127.0.0.1/4433) 2>/dev/null && { exec 3>&- 3<&-; break; }
+      sleep 0.3
     done
     echo
-    echo "--- (c) connect with s_client and capture the negotiated params: ---"
+    echo "--- (d) connect with s_client and capture the negotiated params: ---"
     if openssl s_client -connect 127.0.0.1:4433 -tls1_3 $OQS \
           -groups "$TLS_GROUP" </dev/null 2>&1 \
-          | grep -iE 'Negotiated TLS1.3 group|Server Temp Key|Signature type|Peer signature type|Cipher is' ; then
-      echo "    -> handshake completed using $TLS_GROUP + $SIG_ALG cert."
+          | grep -iE 'Negotiated TLS1.3 group|Peer signature type|Cipher is' ; then
+      echo "    -> handshake completed: $TLS_GROUP key exchange + $CERT_SIG auth."
+      echo "       That FrodoKEM key exchange ran in stock openssl, unmodified,"
+      echo "       purely because oqs-provider was loaded. That is the payoff."
     else
       echo "    -> handshake did not report group/sig; see server.log."
     fi
     kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null
   else
-    echo "    (could not create SLH-DSA cert in this build; skipping handshake)"
+    echo "    (could not create ML-DSA cert in this build; skipping handshake)"
   fi
 else
-  echo "    Missing a Frodo/BIKE TLS group or an SLH-DSA signature in this"
+  echo "    Missing a Frodo/BIKE TLS group or an ML-DSA signature in this"
   echo "    build, so the combined handshake can't be demonstrated here."
   echo "    Hybrid groups advertised:"
   openssl list -kem-algorithms $OQS | grep -iE 'p256_|x25519_|p384_' | head -10 \
@@ -220,13 +279,29 @@ A real algorithm evaluation compares, at minimum:
   * speed            (keygen / encaps-decaps or sign-verify ops per second)
   * security level   (NIST level 1/3/5)
 
-liboqs ships speed harnesses built from the same source you compiled:
-    /tmp/liboqs/build/tests/speed_kem     # FrodoKEM / BIKE / HQC / ML-KEM
-    /tmp/liboqs/build/tests/speed_sig     # SLH-DSA / Falcon / ML-DSA
-Run those for apples-to-apples numbers. Report SIZES alongside SPEED:
-the headline tradeoffs are FrodoKEM/BIKE's large keys/ciphertexts and
-SLH-DSA's large, slow signatures — exactly the costs a TLS-focused
-evaluation needs to surface.
+Step 4 already ran the KEM harness. For signatures, run the matching one to
+quantify SLH-DSA's large/slow signatures:
+TXT
+SPEED_SIG="$(find_harness speed_sig || true)"
+if [ -n "${SPEED_SIG:-}" ]; then
+  SIG_BENCH="$("$SPEED_SIG" --algs 2>/dev/null | grep -iE 'SLH_DSA|SPHINCS' | head -1)"
+  if [ -n "${SIG_BENCH:-}" ]; then
+    echo "    $SPEED_SIG -i -d 1 $SIG_BENCH"
+    "$SPEED_SIG" -i -d 1 "$SIG_BENCH" 2>/dev/null \
+      | grep -iE "$SIG_BENCH|keygen|sign|verify|signature bytes" | head -8 \
+      || echo "    (harness produced no rows)"
+  else
+    echo "    (speed_sig present but lists no SLH-DSA/SPHINCS+ algorithm)"
+  fi
+else
+  echo "    liboqs speed_sig not found on this system; on the container it is at"
+  echo "    /src/liboqs/build/tests/speed_sig"
+fi
+cat <<'TXT'
+
+Report SIZES alongside SPEED: the headline tradeoffs are FrodoKEM/BIKE's large
+keys/ciphertexts and SLH-DSA's large, slow signatures — exactly the costs a
+TLS-focused evaluation needs to surface.
 TXT
 
 echo
