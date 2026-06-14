@@ -15,7 +15,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-CERTDIR="${CERTDIR:-./certs}"
+CERTDIR="${CERTDIR:-../certs}"
 OUT="${OUT:-./out-cluster}"
 HOSTPORT="${HOSTPORT:-30443}"
 IFACE="${IFACE:-lo}"
