@@ -109,6 +109,9 @@ say "Step 1.2 — Which provider actually answers for ML-DSA?"
 next "Prove the standardized algos come from NATIVE OpenSSL, not a plugin."
 run "openssl list -providers"
 run "openssl list -signature-algorithms | grep -i ml-dsa"
+run "openssl list -signature-algorithms | grep -i slh-dsa"
+run "openssl list -kem-algorithms | grep -i kem"
+
 ok "Only 'default'/'base' are loaded, and ML-DSA is tagged '@ default' — native, no oqs-provider."
 pause
 
@@ -188,46 +191,4 @@ ok "Native OpenSSL 3.5 did PQC key exchange (X25519MLKEM768) + PQC auth (ML-DSA-
 ok "Cost is bytes (chain size), interop degrades gracefully, downgrades are silent-but-detectable."
 next "Step 1.10 — the REAL-APP proof: nginx + curl. Run these on the HOST (needs podman),"
 next "reusing the chain.crt/leaf.key this script just wrote to ~/pqc-lab."
-cat <<'HOST_STEPS'
-
-  ----------------------------------------------------------------------------
-  STEP 1.10 (run on the HOST, not inside this container)
-  ----------------------------------------------------------------------------
-  # 1.10a  nginx TLS config (dual-stack listen avoids the IPv6 'Broken pipe' trap)
-  cat > ~/pqc-lab/nginx-pqc.conf <<'EOF'
-  server {
-      listen 8443 ssl;
-      listen [::]:8443 ssl;
-      server_name localhost;
-      ssl_certificate     /etc/nginx/certs/chain.crt;
-      ssl_certificate_key /etc/nginx/certs/leaf.key;
-      ssl_protocols TLSv1.3;
-      location / { return 200 "PQC nginx OK\n"; default_type text/plain; }
-  }
-  EOF
-
-  # 1.10b  Dockerfile for native-OpenSSL nginx
-  cat > ~/pqc-lab/Dockerfile <<'EOF'
-  FROM fedora:43
-  RUN dnf -y install nginx openssl && dnf clean all
-  COPY nginx-pqc.conf /etc/nginx/conf.d/pqc.conf
-  EXPOSE 8443
-  CMD ["nginx", "-g", "daemon off;"]
-  EOF
-
-  # 1.10c/d  build + confirm OpenSSL 3.5
-  cd ~/pqc-lab && podman build -t pqc-nginx .
-  podman run --rm pqc-nginx openssl version
-
-  # 1.10e  run (use --name so 'podman logs pqc-nginx' works)
-  podman run --rm --name pqc-nginx -p 8443:8443 \
-      -v ~/pqc-lab:/etc/nginx/certs:ro,Z pqc-nginx
-
-  # 1.10f  curl it (use localhost so the cert CN matches; dual-stack listen makes ::1 work)
-  curl -v --tls-max 1.3 https://localhost:8443/ --cacert ~/pqc-lab/ca.crt 2>&1 \
-      | grep -iE "group|SSL connection|subject|issuer|PQC nginx"
-  # Expect: TLSv1.3 / ... / X25519MLKEM768 / id-ml-dsa-65   and   PQC nginx OK
-  ----------------------------------------------------------------------------
-
-HOST_STEPS
 printf '%s\n' "${GRN}${BOLD}DEMO 1 DONE.${RST}"
